@@ -489,14 +489,16 @@ func printRestoreDryRun(tasks []restoreTask, workloads []*types.WorkloadInfo) {
 }
 
 // buildR2Prefix creates the prefix for listing/rotating R2 objects for a specific PVC.
-// It takes the output format, replaces {date} with empty string to get the stable prefix,
-// and fills in the other placeholders.
+// It fills in the known placeholders, then truncates at {date} so the prefix matches
+// all date variants of that PVC's backups.
 func buildR2Prefix(outputFormat, namespace, release, pvcName string) string {
 	prefix := outputFormat
 	prefix = strings.ReplaceAll(prefix, "{namespace}", namespace)
 	prefix = strings.ReplaceAll(prefix, "{release}", release)
 	prefix = strings.ReplaceAll(prefix, "{pvc}", pvcName)
-	prefix = strings.ReplaceAll(prefix, "{date}", "")
+	if idx := strings.Index(prefix, "{date}"); idx >= 0 {
+		prefix = prefix[:idx]
+	}
 	return prefix
 }
 

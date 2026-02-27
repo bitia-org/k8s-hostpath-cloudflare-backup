@@ -106,7 +106,7 @@ func TestParseArchiveName_WrongNamespace(t *testing.T) {
 
 func TestBuildR2Prefix_Default(t *testing.T) {
 	prefix := buildR2Prefix("{namespace}_{release}_{pvc}_{date}.tar.gz", "davai", "davai-backend", "redis-data")
-	want := "davai_davai-backend_redis-data_.tar.gz"
+	want := "davai_davai-backend_redis-data_"
 	if prefix != want {
 		t.Errorf("buildR2Prefix() = %q, want %q", prefix, want)
 	}
@@ -114,7 +114,7 @@ func TestBuildR2Prefix_Default(t *testing.T) {
 
 func TestBuildR2Prefix_Custom(t *testing.T) {
 	prefix := buildR2Prefix("backup-{release}-{pvc}-{date}.tar.gz", "ns", "myapp", "data-vol")
-	want := "backup-myapp-data-vol-.tar.gz"
+	want := "backup-myapp-data-vol-"
 	if prefix != want {
 		t.Errorf("buildR2Prefix() = %q, want %q", prefix, want)
 	}
