@@ -159,6 +159,93 @@ func createTarGz(archivePath, sourceDir string) (int64, error) {
 	return stat.Size(), nil
 }
 
+// RestoreOne extracts a tar.gz archive into targetDir, clearing its contents first.
+func (b *Backuper) RestoreOne(archivePath, targetDir string) error {
+	b.logf("Restoring %s -> %s", archivePath, targetDir)
+
+	// Validate target dir exists
+	info, err := os.Stat(targetDir)
+	if err != nil {
+		return fmt.Errorf("target dir %q: %w", targetDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("target %q is not a directory", targetDir)
+	}
+
+	// Clear target dir contents
+	entries, err := os.ReadDir(targetDir)
+	if err != nil {
+		return fmt.Errorf("reading target dir: %w", err)
+	}
+	for _, entry := range entries {
+		p := filepath.Join(targetDir, entry.Name())
+		b.logf("Removing %s", p)
+		if err := os.RemoveAll(p); err != nil {
+			return fmt.Errorf("clearing %s: %w", entry.Name(), err)
+		}
+	}
+
+	// Open archive
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return fmt.Errorf("opening archive: %w", err)
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("gzip reader: %w", err)
+	}
+	defer gr.Close()
+
+	cleanBase := filepath.Clean(targetDir)
+	tr := tar.NewReader(gr)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("reading tar: %w", err)
+		}
+
+		target := filepath.Join(targetDir, hdr.Name)
+		cleanTarget := filepath.Clean(target)
+
+		// Prevent path traversal
+		if cleanTarget != cleanBase && !strings.HasPrefix(cleanTarget, cleanBase+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal path in archive: %s", hdr.Name)
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(out, tr); err != nil {
+				out.Close()
+				return err
+			}
+			out.Close()
+		case tar.TypeSymlink:
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				return err
+			}
+		}
+	}
+
+	b.logf("Restored %s", targetDir)
+	return nil
+}
+
 func (b *Backuper) logf(format string, args ...interface{}) {
 	if b.verbose {
 		log.Printf("[backup] "+format, args...)

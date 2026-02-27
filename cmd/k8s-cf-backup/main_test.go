@@ -55,6 +55,55 @@ func TestUniqueWorkloads_SameNameDifferentKind(t *testing.T) {
 	}
 }
 
+func TestParseArchiveName_Default(t *testing.T) {
+	format := "{namespace}_{release}_{pvc}_{date}.tar.gz"
+	pvc, err := parseArchiveName("davai_davai-backend_redis-data_20240101-120000.tar.gz", format, "davai", "davai-backend")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pvc != "redis-data" {
+		t.Errorf("pvc = %q, want %q", pvc, "redis-data")
+	}
+}
+
+func TestParseArchiveName_WithPath(t *testing.T) {
+	format := "{namespace}_{release}_{pvc}_{date}.tar.gz"
+	pvc, err := parseArchiveName("/tmp/backups/davai_davai-backend_postgres-data_20240315-093000.tar.gz", format, "davai", "davai-backend")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pvc != "postgres-data" {
+		t.Errorf("pvc = %q, want %q", pvc, "postgres-data")
+	}
+}
+
+func TestParseArchiveName_CustomFormat(t *testing.T) {
+	format := "backup-{release}-{pvc}.tar.gz"
+	pvc, err := parseArchiveName("backup-myapp-data-vol.tar.gz", format, "ns", "myapp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pvc != "data-vol" {
+		t.Errorf("pvc = %q, want %q", pvc, "data-vol")
+	}
+}
+
+func TestParseArchiveName_NoMatch(t *testing.T) {
+	format := "{namespace}_{release}_{pvc}_{date}.tar.gz"
+	_, err := parseArchiveName("random-file.txt", format, "ns", "rel")
+	if err == nil {
+		t.Error("expected error for non-matching filename")
+	}
+}
+
+func TestParseArchiveName_WrongNamespace(t *testing.T) {
+	format := "{namespace}_{release}_{pvc}_{date}.tar.gz"
+	_, err := parseArchiveName("wrong_rel_pvc_20240101.tar.gz", format, "ns", "rel")
+	if err == nil {
+		t.Error("expected error for wrong namespace")
+	}
+}
+
 func TestFormatSize(t *testing.T) {
 	tests := []struct {
 		input int64

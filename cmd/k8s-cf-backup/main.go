@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -22,6 +23,11 @@ import (
 )
 
 const defaultOutputFormat = "{namespace}_{release}_{pvc}_{date}.tar.gz"
+
+type restoreTask struct {
+	archivePath string
+	pvc         types.PVCInfo
+}
 
 func main() {
 	var (
@@ -49,6 +55,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Subcommand routing: first positional arg is "backup" or "restore"
+	args := flag.Args()
+	subcommand := "backup"
+	if len(args) > 0 && (args[0] == "backup" || args[0] == "restore") {
+		subcommand = args[0]
+		args = args[1:]
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -57,8 +71,20 @@ func main() {
 		log.Fatalf("Failed to create Kubernetes client: %v", err)
 	}
 
-	if err := run(ctx, client, namespace, release, outputDir, outputFormat, dryRun, verbose); err != nil {
-		log.Fatalf("Error: %v", err)
+	switch subcommand {
+	case "backup":
+		if err := run(ctx, client, namespace, release, outputDir, outputFormat, dryRun, verbose); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+	case "restore":
+		if len(args) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: restore requires at least one archive file")
+			flag.Usage()
+			os.Exit(1)
+		}
+		if err := runRestore(ctx, client, namespace, release, outputFormat, args, dryRun, verbose); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
 	}
 }
 
@@ -186,6 +212,161 @@ func formatSize(bytes int64) string {
 		return fmt.Sprintf("%.1f KB", float64(bytes)/float64(kb))
 	default:
 		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+func runRestore(ctx context.Context, client kubernetes.Interface, namespace, release, outputFormat string, archives []string, dryRun, verbose bool) error {
+	disc := discovery.New(client, verbose)
+	sc := scaler.New(client, verbose)
+	bk := backup.New("", "", verbose)
+
+	// Step 1: Parse archive filenames to extract PVC names
+	type archiveMapping struct {
+		path    string
+		pvcName string
+	}
+	var mappings []archiveMapping
+	for _, archive := range archives {
+		pvcName, err := parseArchiveName(archive, outputFormat, namespace, release)
+		if err != nil {
+			return fmt.Errorf("parsing archive %q: %w", archive, err)
+		}
+		mappings = append(mappings, archiveMapping{path: archive, pvcName: pvcName})
+	}
+
+	fmt.Printf("Parsed %d archive(s):\n", len(mappings))
+	for _, m := range mappings {
+		fmt.Printf("  - %s -> PVC %s\n", filepath.Base(m.path), m.pvcName)
+	}
+
+	// Step 2: Discover PVCs for the release
+	fmt.Printf("\nDiscovering PVCs for release %q in namespace %q...\n", release, namespace)
+	pvcs, err := disc.Discover(ctx, namespace, release)
+	if err != nil {
+		return fmt.Errorf("discovery: %w", err)
+	}
+
+	// Step 3: Match archives to discovered PVCs
+	pvcMap := make(map[string]types.PVCInfo)
+	for _, pvc := range pvcs {
+		pvcMap[pvc.PVCName] = pvc
+	}
+
+	var tasks []restoreTask
+	for _, m := range mappings {
+		pvc, ok := pvcMap[m.pvcName]
+		if !ok {
+			return fmt.Errorf("PVC %q (from archive %q) not found in release %q", m.pvcName, filepath.Base(m.path), release)
+		}
+		tasks = append(tasks, restoreTask{archivePath: m.path, pvc: pvc})
+	}
+
+	fmt.Printf("Matched %d archive(s) to PVC(s):\n", len(tasks))
+	for _, t := range tasks {
+		fmt.Printf("  - %s -> %s (host path: %s)\n", filepath.Base(t.archivePath), t.pvc.PVCName, t.pvc.HostPath)
+	}
+
+	// Collect workloads from matched PVCs
+	var matchedPVCs []types.PVCInfo
+	for _, t := range tasks {
+		matchedPVCs = append(matchedPVCs, t.pvc)
+	}
+	workloads := uniqueWorkloads(matchedPVCs)
+
+	if dryRun {
+		printRestoreDryRun(tasks, workloads)
+		return nil
+	}
+
+	// Step 4: Scale down
+	if len(workloads) > 0 {
+		fmt.Printf("\nScaling down %d workload(s)...\n", len(workloads))
+		defer func() {
+			fmt.Println("\nRestoring workload replicas...")
+			if err := sc.ScaleBack(ctx, workloads); err != nil {
+				log.Printf("WARNING: Failed to restore some workloads: %v", err)
+			} else {
+				fmt.Println("All workloads restored.")
+			}
+		}()
+
+		if err := sc.ScaleDown(ctx, workloads); err != nil {
+			return fmt.Errorf("scale down: %w", err)
+		}
+		fmt.Println("All workloads scaled to 0.")
+	}
+
+	// Step 5: Restore each archive
+	fmt.Printf("\nRestoring %d PVC(s)...\n", len(tasks))
+	var hasError bool
+	for _, t := range tasks {
+		fmt.Printf("  Restoring %s -> %s\n", filepath.Base(t.archivePath), t.pvc.HostPath)
+		if err := bk.RestoreOne(t.archivePath, t.pvc.HostPath); err != nil {
+			fmt.Printf("  FAIL  %s: %v\n", t.pvc.PVCName, err)
+			hasError = true
+		} else {
+			fmt.Printf("  OK    %s\n", t.pvc.PVCName)
+		}
+	}
+
+	// Step 6: Scale back (deferred above)
+
+	// Step 7: Report
+	fmt.Println("\n=== Restore Summary ===")
+	for _, t := range tasks {
+		fmt.Printf("  %s -> %s\n", filepath.Base(t.archivePath), t.pvc.PVCName)
+	}
+
+	if hasError {
+		return fmt.Errorf("some restores failed (see above)")
+	}
+	return nil
+}
+
+// parseArchiveName extracts the PVC name from an archive filename using the output format pattern.
+// It replaces {namespace} and {release} with their known values, {date} with a wildcard,
+// and captures {pvc} via a regex group.
+func parseArchiveName(archivePath, format, namespace, release string) (string, error) {
+	filename := filepath.Base(archivePath)
+
+	// Escape the format as a regex literal, then replace placeholders
+	pattern := regexp.QuoteMeta(format)
+	pattern = strings.ReplaceAll(pattern, regexp.QuoteMeta("{namespace}"), regexp.QuoteMeta(namespace))
+	pattern = strings.ReplaceAll(pattern, regexp.QuoteMeta("{release}"), regexp.QuoteMeta(release))
+	pattern = strings.ReplaceAll(pattern, regexp.QuoteMeta("{pvc}"), "(.+?)")
+	pattern = strings.ReplaceAll(pattern, regexp.QuoteMeta("{date}"), ".+")
+	pattern = "^" + pattern + "$"
+
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return "", fmt.Errorf("invalid format pattern: %w", err)
+	}
+
+	matches := re.FindStringSubmatch(filename)
+	if matches == nil {
+		return "", fmt.Errorf("filename %q does not match format %q", filename, format)
+	}
+
+	return matches[1], nil
+}
+
+func printRestoreDryRun(tasks []restoreTask, workloads []*types.WorkloadInfo) {
+	fmt.Println("\n=== DRY RUN ===")
+	if len(workloads) > 0 {
+		fmt.Println("\nWould scale down:")
+		for _, w := range workloads {
+			fmt.Printf("  - %s/%s (currently %d replicas)\n", w.Kind, w.Name, w.OriginalReplicas)
+		}
+	}
+	fmt.Println("\nWould restore:")
+	for _, t := range tasks {
+		fmt.Printf("  - %s -> %s (host path: %s)\n", filepath.Base(t.archivePath), t.pvc.PVCName, t.pvc.HostPath)
+	}
+	if len(workloads) > 0 {
+		fmt.Println("\nWould restore replicas:")
+		for _, w := range workloads {
+			fmt.Printf("  - %s/%s -> %d replicas\n", w.Kind, w.Name, w.OriginalReplicas)
+		}
 	}
 }
 

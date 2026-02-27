@@ -200,6 +200,69 @@ func TestBackupOne_NotADirectory(t *testing.T) {
 	}
 }
 
+func TestRestoreOne_RoundTrip(t *testing.T) {
+	// Create source directory with files
+	srcDir := t.TempDir()
+	os.WriteFile(filepath.Join(srcDir, "file1.txt"), []byte("hello"), 0644)
+	sub := filepath.Join(srcDir, "subdir")
+	os.Mkdir(sub, 0755)
+	os.WriteFile(filepath.Join(sub, "file2.txt"), []byte("world"), 0644)
+
+	// Create archive from source
+	outDir := t.TempDir()
+	archivePath := filepath.Join(outDir, "test.tar.gz")
+	if _, err := createTarGz(archivePath, srcDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore into a new directory (with some pre-existing content that should be cleared)
+	restoreDir := t.TempDir()
+	os.WriteFile(filepath.Join(restoreDir, "stale.txt"), []byte("should be removed"), 0644)
+
+	b := New("", "", false)
+	if err := b.RestoreOne(archivePath, restoreDir); err != nil {
+		t.Fatalf("RestoreOne() error: %v", err)
+	}
+
+	// Verify restored contents
+	data, err := os.ReadFile(filepath.Join(restoreDir, "file1.txt"))
+	if err != nil {
+		t.Fatalf("reading file1.txt: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("file1.txt = %q, want %q", string(data), "hello")
+	}
+
+	data, err = os.ReadFile(filepath.Join(restoreDir, "subdir", "file2.txt"))
+	if err != nil {
+		t.Fatalf("reading subdir/file2.txt: %v", err)
+	}
+	if string(data) != "world" {
+		t.Errorf("subdir/file2.txt = %q, want %q", string(data), "world")
+	}
+
+	// Verify stale file was removed
+	if _, err := os.Stat(filepath.Join(restoreDir, "stale.txt")); !os.IsNotExist(err) {
+		t.Error("stale.txt should have been removed during restore")
+	}
+}
+
+func TestRestoreOne_NonexistentArchive(t *testing.T) {
+	b := New("", "", false)
+	err := b.RestoreOne("/nonexistent/archive.tar.gz", t.TempDir())
+	if err == nil {
+		t.Error("expected error for nonexistent archive")
+	}
+}
+
+func TestRestoreOne_NonexistentTargetDir(t *testing.T) {
+	b := New("", "", false)
+	err := b.RestoreOne("anything.tar.gz", "/nonexistent/dir/12345")
+	if err == nil {
+		t.Error("expected error for nonexistent target dir")
+	}
+}
+
 // --- helpers ---
 
 func readTarGzEntries(t *testing.T, path string) []string {
