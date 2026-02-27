@@ -13,6 +13,7 @@ import (
 
 	"github.com/bitia-ru/k8s-hostpath-cloudflare-backup/pkg/backup"
 	"github.com/bitia-ru/k8s-hostpath-cloudflare-backup/pkg/discovery"
+	"github.com/bitia-ru/k8s-hostpath-cloudflare-backup/pkg/r2"
 	"github.com/bitia-ru/k8s-hostpath-cloudflare-backup/pkg/scaler"
 	"github.com/bitia-ru/k8s-hostpath-cloudflare-backup/pkg/types"
 
@@ -31,13 +32,15 @@ type restoreTask struct {
 
 func main() {
 	var (
-		namespace    string
-		release      string
-		outputFormat string
-		outputDir    string
-		dryRun       bool
-		verbose      bool
-		kubeconfig   string
+		namespace     string
+		release       string
+		outputFormat  string
+		outputDir     string
+		dryRun        bool
+		verbose       bool
+		kubeconfig    string
+		r2Credentials string
+		keepLast      int
 	)
 
 	flag.StringVarP(&namespace, "namespace", "n", "", "Kubernetes namespace (required)")
@@ -47,6 +50,8 @@ func main() {
 	flag.BoolVar(&dryRun, "dry-run", false, "Show what would be done without doing it")
 	flag.BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig (default: in-cluster or ~/.kube/config)")
+	flag.StringVar(&r2Credentials, "r2-credentials", "", "Path to R2 credentials JSON (enables R2 upload/download)")
+	flag.IntVar(&keepLast, "keep-last", 0, "Number of backups to keep per PVC in R2 (0 = unlimited)")
 	flag.Parse()
 
 	if namespace == "" || release == "" {
@@ -73,22 +78,22 @@ func main() {
 
 	switch subcommand {
 	case "backup":
-		if err := run(ctx, client, namespace, release, outputDir, outputFormat, dryRun, verbose); err != nil {
+		if err := run(ctx, client, namespace, release, outputDir, outputFormat, r2Credentials, keepLast, dryRun, verbose); err != nil {
 			log.Fatalf("Error: %v", err)
 		}
 	case "restore":
-		if len(args) == 0 {
-			fmt.Fprintln(os.Stderr, "Error: restore requires at least one archive file")
+		if len(args) == 0 && r2Credentials == "" {
+			fmt.Fprintln(os.Stderr, "Error: restore requires archive files or --r2-credentials")
 			flag.Usage()
 			os.Exit(1)
 		}
-		if err := runRestore(ctx, client, namespace, release, outputFormat, args, dryRun, verbose); err != nil {
+		if err := runRestore(ctx, client, namespace, release, outputFormat, r2Credentials, args, dryRun, verbose); err != nil {
 			log.Fatalf("Error: %v", err)
 		}
 	}
 }
 
-func run(ctx context.Context, client kubernetes.Interface, namespace, release, outputDir, outputFormat string, dryRun, verbose bool) error {
+func run(ctx context.Context, client kubernetes.Interface, namespace, release, outputDir, outputFormat, r2Credentials string, keepLast int, dryRun, verbose bool) error {
 	disc := discovery.New(client, verbose)
 	sc := scaler.New(client, verbose)
 	bk := backup.New(outputDir, outputFormat, verbose)
@@ -113,7 +118,7 @@ func run(ctx context.Context, client kubernetes.Interface, namespace, release, o
 	workloads := uniqueWorkloads(pvcs)
 
 	if dryRun {
-		printDryRun(pvcs, workloads, outputDir, outputFormat, namespace, release)
+		printDryRun(pvcs, workloads, outputDir, outputFormat, namespace, release, r2Credentials, keepLast)
 		return nil
 	}
 
@@ -155,6 +160,46 @@ func run(ctx context.Context, client kubernetes.Interface, namespace, release, o
 	if hasError {
 		return fmt.Errorf("some backups failed (see above)")
 	}
+
+	// Step 5: R2 upload + rotation
+	if r2Credentials != "" {
+		creds, err := r2.LoadCredentials(r2Credentials)
+		if err != nil {
+			return fmt.Errorf("r2 credentials: %w", err)
+		}
+		r2Client, err := r2.New(creds, verbose)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("\n=== R2 Upload ===")
+		for _, r := range results {
+			if r.Err != nil {
+				continue
+			}
+			key := filepath.Base(r.ArchivePath)
+			if err := r2Client.Upload(ctx, r.ArchivePath, key); err != nil {
+				fmt.Printf("  FAIL  %s: %v\n", key, err)
+			} else {
+				fmt.Printf("  OK    %s uploaded\n", key)
+			}
+		}
+
+		if keepLast > 0 {
+			fmt.Printf("\n=== R2 Rotation (keep last %d) ===\n", keepLast)
+			for _, pvc := range pvcs {
+				prefix := buildR2Prefix(outputFormat, namespace, release, pvc.PVCName)
+				deleted, err := r2Client.Rotate(ctx, prefix, keepLast)
+				if err != nil {
+					fmt.Printf("  FAIL  %s: %v\n", pvc.PVCName, err)
+				}
+				for _, key := range deleted {
+					fmt.Printf("  DEL   %s\n", key)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -176,7 +221,7 @@ func uniqueWorkloads(pvcs []types.PVCInfo) []*types.WorkloadInfo {
 	return result
 }
 
-func printDryRun(pvcs []types.PVCInfo, workloads []*types.WorkloadInfo, outputDir, outputFormat, namespace, release string) {
+func printDryRun(pvcs []types.PVCInfo, workloads []*types.WorkloadInfo, outputDir, outputFormat, namespace, release, r2Credentials string, keepLast int) {
 	fmt.Println("\n=== DRY RUN ===")
 	if len(workloads) > 0 {
 		fmt.Println("\nWould scale down:")
@@ -188,6 +233,16 @@ func printDryRun(pvcs []types.PVCInfo, workloads []*types.WorkloadInfo, outputDi
 	for _, pvc := range pvcs {
 		name := backup.FormatName(outputFormat, namespace, release, pvc.PVCName)
 		fmt.Printf("  - %s -> %s\n", pvc.HostPath, filepath.Join(outputDir, name))
+	}
+	if r2Credentials != "" {
+		fmt.Println("\nWould upload to R2:")
+		for _, pvc := range pvcs {
+			name := backup.FormatName(outputFormat, namespace, release, pvc.PVCName)
+			fmt.Printf("  - %s\n", name)
+		}
+		if keepLast > 0 {
+			fmt.Printf("\nWould rotate R2 backups (keep last %d per PVC)\n", keepLast)
+		}
 	}
 	if len(workloads) > 0 {
 		fmt.Println("\nWould restore replicas:")
@@ -215,50 +270,115 @@ func formatSize(bytes int64) string {
 	}
 }
 
-func runRestore(ctx context.Context, client kubernetes.Interface, namespace, release, outputFormat string, archives []string, dryRun, verbose bool) error {
+func runRestore(ctx context.Context, client kubernetes.Interface, namespace, release, outputFormat, r2Credentials string, archives []string, dryRun, verbose bool) error {
 	disc := discovery.New(client, verbose)
 	sc := scaler.New(client, verbose)
 	bk := backup.New("", "", verbose)
 
-	// Step 1: Parse archive filenames to extract PVC names
-	type archiveMapping struct {
-		path    string
-		pvcName string
-	}
-	var mappings []archiveMapping
-	for _, archive := range archives {
-		pvcName, err := parseArchiveName(archive, outputFormat, namespace, release)
-		if err != nil {
-			return fmt.Errorf("parsing archive %q: %w", archive, err)
-		}
-		mappings = append(mappings, archiveMapping{path: archive, pvcName: pvcName})
-	}
-
-	fmt.Printf("Parsed %d archive(s):\n", len(mappings))
-	for _, m := range mappings {
-		fmt.Printf("  - %s -> PVC %s\n", filepath.Base(m.path), m.pvcName)
-	}
-
-	// Step 2: Discover PVCs for the release
-	fmt.Printf("\nDiscovering PVCs for release %q in namespace %q...\n", release, namespace)
+	// Step 1: Discover PVCs for the release
+	fmt.Printf("Discovering PVCs for release %q in namespace %q...\n", release, namespace)
 	pvcs, err := disc.Discover(ctx, namespace, release)
 	if err != nil {
 		return fmt.Errorf("discovery: %w", err)
 	}
 
-	// Step 3: Match archives to discovered PVCs
 	pvcMap := make(map[string]types.PVCInfo)
 	for _, pvc := range pvcs {
 		pvcMap[pvc.PVCName] = pvc
 	}
 
 	var tasks []restoreTask
-	for _, m := range mappings {
-		pvc, ok := pvcMap[m.pvcName]
-		if !ok {
-			return fmt.Errorf("PVC %q (from archive %q) not found in release %q", m.pvcName, filepath.Base(m.path), release)
+	var tmpDir string // for R2 downloads
+
+	if r2Credentials != "" {
+		creds, err := r2.LoadCredentials(r2Credentials)
+		if err != nil {
+			return fmt.Errorf("r2 credentials: %w", err)
 		}
-		tasks = append(tasks, restoreTask{archivePath: m.path, pvc: pvc})
+		r2Client, err := r2.New(creds, verbose)
+		if err != nil {
+			return err
+		}
+
+		tmpDir, err = os.MkdirTemp("", "k8s-cf-backup-restore-*")
+		if err != nil {
+			return fmt.Errorf("creating temp dir: %w", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		if len(archives) > 0 {
+			// R2 credentials + explicit keys: download those specific keys
+			fmt.Printf("Downloading %d archive(s) from R2...\n", len(archives))
+			for _, key := range archives {
+				pvcName, err := parseArchiveName(key, outputFormat, namespace, release)
+				if err != nil {
+					return fmt.Errorf("parsing R2 key %q: %w", key, err)
+				}
+				pvc, ok := pvcMap[pvcName]
+				if !ok {
+					return fmt.Errorf("PVC %q (from R2 key %q) not found in release %q", pvcName, key, release)
+				}
+				destPath := filepath.Join(tmpDir, key)
+				if err := r2Client.Download(ctx, key, destPath); err != nil {
+					return fmt.Errorf("downloading %q: %w", key, err)
+				}
+				fmt.Printf("  Downloaded %s\n", key)
+				tasks = append(tasks, restoreTask{archivePath: destPath, pvc: pvc})
+			}
+		} else {
+			// R2 credentials + no explicit keys: find latest per PVC
+			fmt.Println("Finding latest R2 backups per PVC...")
+			for _, pvc := range pvcs {
+				prefix := buildR2Prefix(outputFormat, namespace, release, pvc.PVCName)
+				objects, err := r2Client.ListByPrefix(ctx, prefix)
+				if err != nil {
+					return fmt.Errorf("listing R2 objects for %s: %w", pvc.PVCName, err)
+				}
+				if len(objects) == 0 {
+					fmt.Printf("  SKIP  %s: no backups found in R2\n", pvc.PVCName)
+					continue
+				}
+				latest := objects[0] // sorted newest first
+				destPath := filepath.Join(tmpDir, latest.Key)
+				if err := r2Client.Download(ctx, latest.Key, destPath); err != nil {
+					return fmt.Errorf("downloading %q: %w", latest.Key, err)
+				}
+				fmt.Printf("  Downloaded %s (latest for %s)\n", latest.Key, pvc.PVCName)
+				tasks = append(tasks, restoreTask{archivePath: destPath, pvc: pvc})
+			}
+		}
+	} else {
+		// Local file restore (unchanged path)
+		type archiveMapping struct {
+			path    string
+			pvcName string
+		}
+		var mappings []archiveMapping
+		for _, archive := range archives {
+			pvcName, err := parseArchiveName(archive, outputFormat, namespace, release)
+			if err != nil {
+				return fmt.Errorf("parsing archive %q: %w", archive, err)
+			}
+			mappings = append(mappings, archiveMapping{path: archive, pvcName: pvcName})
+		}
+
+		fmt.Printf("Parsed %d archive(s):\n", len(mappings))
+		for _, m := range mappings {
+			fmt.Printf("  - %s -> PVC %s\n", filepath.Base(m.path), m.pvcName)
+		}
+
+		for _, m := range mappings {
+			pvc, ok := pvcMap[m.pvcName]
+			if !ok {
+				return fmt.Errorf("PVC %q (from archive %q) not found in release %q", m.pvcName, filepath.Base(m.path), release)
+			}
+			tasks = append(tasks, restoreTask{archivePath: m.path, pvc: pvc})
+		}
+	}
+
+	if len(tasks) == 0 {
+		fmt.Println("No archives to restore.")
+		return nil
 	}
 
 	fmt.Printf("Matched %d archive(s) to PVC(s):\n", len(tasks))
@@ -278,7 +398,7 @@ func runRestore(ctx context.Context, client kubernetes.Interface, namespace, rel
 		return nil
 	}
 
-	// Step 4: Scale down
+	// Scale down
 	if len(workloads) > 0 {
 		fmt.Printf("\nScaling down %d workload(s)...\n", len(workloads))
 		defer func() {
@@ -296,7 +416,7 @@ func runRestore(ctx context.Context, client kubernetes.Interface, namespace, rel
 		fmt.Println("All workloads scaled to 0.")
 	}
 
-	// Step 5: Restore each archive
+	// Restore each archive
 	fmt.Printf("\nRestoring %d PVC(s)...\n", len(tasks))
 	var hasError bool
 	for _, t := range tasks {
@@ -309,9 +429,7 @@ func runRestore(ctx context.Context, client kubernetes.Interface, namespace, rel
 		}
 	}
 
-	// Step 6: Scale back (deferred above)
-
-	// Step 7: Report
+	// Report
 	fmt.Println("\n=== Restore Summary ===")
 	for _, t := range tasks {
 		fmt.Printf("  %s -> %s\n", filepath.Base(t.archivePath), t.pvc.PVCName)
@@ -368,6 +486,18 @@ func printRestoreDryRun(tasks []restoreTask, workloads []*types.WorkloadInfo) {
 			fmt.Printf("  - %s/%s -> %d replicas\n", w.Kind, w.Name, w.OriginalReplicas)
 		}
 	}
+}
+
+// buildR2Prefix creates the prefix for listing/rotating R2 objects for a specific PVC.
+// It takes the output format, replaces {date} with empty string to get the stable prefix,
+// and fills in the other placeholders.
+func buildR2Prefix(outputFormat, namespace, release, pvcName string) string {
+	prefix := outputFormat
+	prefix = strings.ReplaceAll(prefix, "{namespace}", namespace)
+	prefix = strings.ReplaceAll(prefix, "{release}", release)
+	prefix = strings.ReplaceAll(prefix, "{pvc}", pvcName)
+	prefix = strings.ReplaceAll(prefix, "{date}", "")
+	return prefix
 }
 
 func buildClient(kubeconfig string) (kubernetes.Interface, error) {

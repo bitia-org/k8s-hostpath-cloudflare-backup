@@ -104,6 +104,30 @@ func TestParseArchiveName_WrongNamespace(t *testing.T) {
 	}
 }
 
+func TestBuildR2Prefix_Default(t *testing.T) {
+	prefix := buildR2Prefix("{namespace}_{release}_{pvc}_{date}.tar.gz", "davai", "davai-backend", "redis-data")
+	want := "davai_davai-backend_redis-data_.tar.gz"
+	if prefix != want {
+		t.Errorf("buildR2Prefix() = %q, want %q", prefix, want)
+	}
+}
+
+func TestBuildR2Prefix_Custom(t *testing.T) {
+	prefix := buildR2Prefix("backup-{release}-{pvc}-{date}.tar.gz", "ns", "myapp", "data-vol")
+	want := "backup-myapp-data-vol-.tar.gz"
+	if prefix != want {
+		t.Errorf("buildR2Prefix() = %q, want %q", prefix, want)
+	}
+}
+
+func TestBuildR2Prefix_NoDate(t *testing.T) {
+	prefix := buildR2Prefix("{namespace}_{release}_{pvc}.tar.gz", "ns", "rel", "pvc1")
+	want := "ns_rel_pvc1.tar.gz"
+	if prefix != want {
+		t.Errorf("buildR2Prefix() = %q, want %q", prefix, want)
+	}
+}
+
 func TestFormatSize(t *testing.T) {
 	tests := []struct {
 		input int64
