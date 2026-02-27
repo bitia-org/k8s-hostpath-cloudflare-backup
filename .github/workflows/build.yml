@@ -1,0 +1,26 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go test ./...
+
+      - run: GOOS=linux GOARCH=amd64 go build -o k8s-cf-backup ./cmd/k8s-cf-backup/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k8s-cf-backup-linux-amd64
+          path: k8s-cf-backup
