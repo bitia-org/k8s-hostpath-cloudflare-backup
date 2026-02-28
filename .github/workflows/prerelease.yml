@@ -31,13 +31,12 @@ jobs:
           cp k8s-cf-backup bottle/k8s-cf-backup/${version}/bin/
           tar czf "k8s-cf-backup--${version}.x86_64_linux.bottle.tar.gz" -C bottle "k8s-cf-backup/${version}"
 
-      - name: Create GitHub release
+      - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          gh release create "${GITHUB_REF_NAME}" \
-            --prerelease \
-            --generate-notes \
+          gh release upload "${GITHUB_REF_NAME}" \
+            \
             k8s-cf-backup-linux-amd64.tar.gz \
             "k8s-cf-backup--${version}.x86_64_linux.bottle.tar.gz"
