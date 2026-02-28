@@ -13,14 +13,14 @@ import (
 )
 
 func TestFormatName(t *testing.T) {
-	b := &Backuper{outputFormat: "{namespace}_{release}_{pvc}_{date}.tar.gz"}
+	b := &Backuper{outputFormat: "{namespace}_{release}_{date}_{pvc}.tar.gz"}
 	name := b.formatName("prod", "myapp", "data-pvc")
 
-	if !strings.HasPrefix(name, "prod_myapp_data-pvc_") {
-		t.Errorf("formatName() = %q, want prefix %q", name, "prod_myapp_data-pvc_")
+	if !strings.HasPrefix(name, "prod_myapp_") {
+		t.Errorf("formatName() = %q, want prefix %q", name, "prod_myapp_")
 	}
-	if !strings.HasSuffix(name, ".tar.gz") {
-		t.Errorf("formatName() = %q, want suffix .tar.gz", name)
+	if !strings.HasSuffix(name, "_data-pvc.tar.gz") {
+		t.Errorf("formatName() = %q, want suffix %q", name, "_data-pvc.tar.gz")
 	}
 }
 

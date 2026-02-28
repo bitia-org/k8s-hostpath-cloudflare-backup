@@ -2,7 +2,9 @@ package main
 
 import (
 	"testing"
+	"time"
 
+	"github.com/bitia-ru/k8s-hostpath-cloudflare-backup/pkg/r2"
 	"github.com/bitia-ru/k8s-hostpath-cloudflare-backup/pkg/types"
 )
 
@@ -56,8 +58,8 @@ func TestUniqueWorkloads_SameNameDifferentKind(t *testing.T) {
 }
 
 func TestParseArchiveName_Default(t *testing.T) {
-	format := "{namespace}_{release}_{pvc}_{date}.tar.gz"
-	pvc, err := parseArchiveName("davai_davai-backend_redis-data_20240101-120000.tar.gz", format, "davai", "davai-backend")
+	format := "{namespace}_{release}_{date}_{pvc}.tar.gz"
+	pvc, err := parseArchiveName("davai_davai-backend_20240101-120000_redis-data.tar.gz", format, "davai", "davai-backend")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -67,8 +69,8 @@ func TestParseArchiveName_Default(t *testing.T) {
 }
 
 func TestParseArchiveName_WithPath(t *testing.T) {
-	format := "{namespace}_{release}_{pvc}_{date}.tar.gz"
-	pvc, err := parseArchiveName("/tmp/backups/davai_davai-backend_postgres-data_20240315-093000.tar.gz", format, "davai", "davai-backend")
+	format := "{namespace}_{release}_{date}_{pvc}.tar.gz"
+	pvc, err := parseArchiveName("/tmp/backups/davai_davai-backend_20240315-093000_postgres-data.tar.gz", format, "davai", "davai-backend")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -89,7 +91,7 @@ func TestParseArchiveName_CustomFormat(t *testing.T) {
 }
 
 func TestParseArchiveName_NoMatch(t *testing.T) {
-	format := "{namespace}_{release}_{pvc}_{date}.tar.gz"
+	format := "{namespace}_{release}_{date}_{pvc}.tar.gz"
 	_, err := parseArchiveName("random-file.txt", format, "ns", "rel")
 	if err == nil {
 		t.Error("expected error for non-matching filename")
@@ -97,16 +99,16 @@ func TestParseArchiveName_NoMatch(t *testing.T) {
 }
 
 func TestParseArchiveName_WrongNamespace(t *testing.T) {
-	format := "{namespace}_{release}_{pvc}_{date}.tar.gz"
-	_, err := parseArchiveName("wrong_rel_pvc_20240101.tar.gz", format, "ns", "rel")
+	format := "{namespace}_{release}_{date}_{pvc}.tar.gz"
+	_, err := parseArchiveName("wrong_rel_20240101_pvc.tar.gz", format, "ns", "rel")
 	if err == nil {
 		t.Error("expected error for wrong namespace")
 	}
 }
 
 func TestBuildR2Prefix_Default(t *testing.T) {
-	prefix := buildR2Prefix("{namespace}_{release}_{pvc}_{date}.tar.gz", "davai", "davai-backend", "redis-data")
-	want := "davai_davai-backend_redis-data_"
+	prefix := buildR2Prefix("{namespace}_{release}_{date}_{pvc}.tar.gz", "davai", "davai-backend", "redis-data")
+	want := "davai_davai-backend_"
 	if prefix != want {
 		t.Errorf("buildR2Prefix() = %q, want %q", prefix, want)
 	}
@@ -125,6 +127,46 @@ func TestBuildR2Prefix_NoDate(t *testing.T) {
 	want := "ns_rel_pvc1.tar.gz"
 	if prefix != want {
 		t.Errorf("buildR2Prefix() = %q, want %q", prefix, want)
+	}
+}
+
+func TestBuildR2Pattern_Default(t *testing.T) {
+	pattern := buildR2Pattern("{namespace}_{release}_{date}_{pvc}.tar.gz", "davai", "davai-backend", "redis-data")
+	if !pattern.MatchString("davai_davai-backend_20240101-120000_redis-data.tar.gz") {
+		t.Error("pattern should match correct key")
+	}
+	if pattern.MatchString("davai_davai-backend_20240101-120000_postgres-data.tar.gz") {
+		t.Error("pattern should not match different PVC")
+	}
+}
+
+func TestBuildR2Pattern_Custom(t *testing.T) {
+	pattern := buildR2Pattern("backup-{release}-{date}-{pvc}.tar.gz", "ns", "myapp", "data-vol")
+	if !pattern.MatchString("backup-myapp-20240101-120000-data-vol.tar.gz") {
+		t.Error("pattern should match correct key")
+	}
+	if pattern.MatchString("backup-myapp-20240101-120000-other-vol.tar.gz") {
+		t.Error("pattern should not match different PVC")
+	}
+}
+
+func TestFilterR2Objects(t *testing.T) {
+	pattern := buildR2Pattern("{namespace}_{release}_{date}_{pvc}.tar.gz", "ns", "rel", "pvc-a")
+	objects := []r2.ObjectInfo{
+		{Key: "ns_rel_20240101-120000_pvc-a.tar.gz", LastModified: time.Now()},
+		{Key: "ns_rel_20240101-120000_pvc-b.tar.gz", LastModified: time.Now()},
+		{Key: "ns_rel_20240102-120000_pvc-a.tar.gz", LastModified: time.Now()},
+	}
+
+	filtered := filterR2Objects(objects, pattern)
+	if len(filtered) != 2 {
+		t.Fatalf("expected 2 filtered objects, got %d", len(filtered))
+	}
+	if filtered[0].Key != "ns_rel_20240101-120000_pvc-a.tar.gz" {
+		t.Errorf("filtered[0].Key = %q, want pvc-a key", filtered[0].Key)
+	}
+	if filtered[1].Key != "ns_rel_20240102-120000_pvc-a.tar.gz" {
+		t.Errorf("filtered[1].Key = %q, want pvc-a key", filtered[1].Key)
 	}
 }
 

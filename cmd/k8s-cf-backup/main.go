@@ -23,7 +23,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-const defaultOutputFormat = "{namespace}_{release}_{pvc}_{date}.tar.gz"
+const defaultOutputFormat = "{namespace}_{release}_{date}_{pvc}.tar.gz"
 
 type restoreTask struct {
 	archivePath string
@@ -52,6 +52,34 @@ func main() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig (default: in-cluster or ~/.kube/config)")
 	flag.StringVar(&r2Credentials, "r2-credentials", "", "Path to R2 credentials JSON (enables R2 upload/download)")
 	flag.IntVar(&keepLast, "keep-last", 0, "Number of backups to keep per PVC in R2 (0 = unlimited)")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Backup and restore Kubernetes PersistentVolume host paths for a Helm release.
+
+Usage:
+  k8s-cf-backup [flags] backup
+  k8s-cf-backup [flags] restore [archive-files...]
+
+Subcommands:
+  backup    Create tar.gz archives of PV host paths (default)
+  restore   Restore from local archives or R2 storage
+
+The restore subcommand accepts optional positional arguments:
+  - With --r2-credentials and no arguments: restores latest backup per PVC from R2
+  - With --r2-credentials and arguments: downloads and restores specified R2 keys
+  - Without --r2-credentials: restores from local archive file paths
+
+Format placeholders for --output-format:
+  {namespace}  Kubernetes namespace
+  {release}    Helm release name
+  {pvc}        PersistentVolumeClaim name
+  {date}       Timestamp (YYYYMMdd-HHmmss)
+
+Flags:
+`)
+		flag.PrintDefaults()
+	}
+
 	flag.Parse()
 
 	if namespace == "" || release == "" {
@@ -189,12 +217,21 @@ func run(ctx context.Context, client kubernetes.Interface, namespace, release, o
 			fmt.Printf("\n=== R2 Rotation (keep last %d) ===\n", keepLast)
 			for _, pvc := range pvcs {
 				prefix := buildR2Prefix(outputFormat, namespace, release, pvc.PVCName)
-				deleted, err := r2Client.Rotate(ctx, prefix, keepLast)
+				allObjects, err := r2Client.ListByPrefix(ctx, prefix)
 				if err != nil {
 					fmt.Printf("  FAIL  %s: %v\n", pvc.PVCName, err)
+					continue
 				}
-				for _, key := range deleted {
-					fmt.Printf("  DEL   %s\n", key)
+				objects := filterR2Objects(allObjects, buildR2Pattern(outputFormat, namespace, release, pvc.PVCName))
+				if len(objects) <= keepLast {
+					continue
+				}
+				for _, obj := range objects[keepLast:] {
+					if err := r2Client.Delete(ctx, obj.Key); err != nil {
+						fmt.Printf("  FAIL  %s: %v\n", obj.Key, err)
+					} else {
+						fmt.Printf("  DEL   %s\n", obj.Key)
+					}
 				}
 			}
 		}
@@ -330,10 +367,11 @@ func runRestore(ctx context.Context, client kubernetes.Interface, namespace, rel
 			fmt.Println("Finding latest R2 backups per PVC...")
 			for _, pvc := range pvcs {
 				prefix := buildR2Prefix(outputFormat, namespace, release, pvc.PVCName)
-				objects, err := r2Client.ListByPrefix(ctx, prefix)
+				allObjects, err := r2Client.ListByPrefix(ctx, prefix)
 				if err != nil {
 					return fmt.Errorf("listing R2 objects for %s: %w", pvc.PVCName, err)
 				}
+				objects := filterR2Objects(allObjects, buildR2Pattern(outputFormat, namespace, release, pvc.PVCName))
 				if len(objects) == 0 {
 					fmt.Printf("  SKIP  %s: no backups found in R2\n", pvc.PVCName)
 					continue
@@ -488,9 +526,10 @@ func printRestoreDryRun(tasks []restoreTask, workloads []*types.WorkloadInfo) {
 	}
 }
 
-// buildR2Prefix creates the prefix for listing/rotating R2 objects for a specific PVC.
+// buildR2Prefix creates an S3 prefix for efficiently listing R2 objects.
 // It fills in the known placeholders, then truncates at {date} so the prefix matches
-// all date variants of that PVC's backups.
+// all date variants. Note: when {date} precedes {pvc} in the format, the prefix may
+// be broader than a single PVC — use buildR2Pattern to filter results precisely.
 func buildR2Prefix(outputFormat, namespace, release, pvcName string) string {
 	prefix := outputFormat
 	prefix = strings.ReplaceAll(prefix, "{namespace}", namespace)
@@ -500,6 +539,28 @@ func buildR2Prefix(outputFormat, namespace, release, pvcName string) string {
 		prefix = prefix[:idx]
 	}
 	return prefix
+}
+
+// buildR2Pattern creates a regex that matches R2 keys for a specific PVC,
+// regardless of placeholder order in the format template.
+func buildR2Pattern(outputFormat, namespace, release, pvcName string) *regexp.Regexp {
+	pattern := regexp.QuoteMeta(outputFormat)
+	pattern = strings.ReplaceAll(pattern, regexp.QuoteMeta("{namespace}"), regexp.QuoteMeta(namespace))
+	pattern = strings.ReplaceAll(pattern, regexp.QuoteMeta("{release}"), regexp.QuoteMeta(release))
+	pattern = strings.ReplaceAll(pattern, regexp.QuoteMeta("{pvc}"), regexp.QuoteMeta(pvcName))
+	pattern = strings.ReplaceAll(pattern, regexp.QuoteMeta("{date}"), ".+")
+	return regexp.MustCompile("^" + pattern + "$")
+}
+
+// filterR2Objects returns only the objects whose keys match the given pattern.
+func filterR2Objects(objects []r2.ObjectInfo, pattern *regexp.Regexp) []r2.ObjectInfo {
+	var filtered []r2.ObjectInfo
+	for _, obj := range objects {
+		if pattern.MatchString(obj.Key) {
+			filtered = append(filtered, obj)
+		}
+	}
+	return filtered
 }
 
 func buildClient(kubeconfig string) (kubernetes.Interface, error) {
