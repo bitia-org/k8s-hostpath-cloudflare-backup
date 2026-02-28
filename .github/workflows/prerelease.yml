@@ -1,0 +1,31 @@
+name: Pre-release
+
+on:
+  push:
+    tags:
+      - 'v*-*'
+
+permissions:
+  contents: write
+
+jobs:
+  prerelease:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go test ./...
+
+      - run: GOOS=linux GOARCH=amd64 go build -o k8s-cf-backup ./cmd/k8s-cf-backup/
+
+      - run: tar czf k8s-cf-backup-linux-amd64.tar.gz k8s-cf-backup
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: k8s-cf-backup-linux-amd64.tar.gz
+          generate_release_notes: true
