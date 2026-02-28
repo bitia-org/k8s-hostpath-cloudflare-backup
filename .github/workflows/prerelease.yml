@@ -31,11 +31,13 @@ jobs:
           cp k8s-cf-backup bottle/k8s-cf-backup/${version}/bin/
           tar czf "k8s-cf-backup--${version}.x86_64_linux.bottle.tar.gz" -C bottle "k8s-cf-backup/${version}"
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          prerelease: true
-          make_latest: false
-          files: |
-            k8s-cf-backup-linux-amd64.tar.gz
-            k8s-cf-backup--*.x86_64_linux.bottle.tar.gz
-          generate_release_notes: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "${GITHUB_REF_NAME}" \
+            --prerelease \
+            --generate-notes \
+            k8s-cf-backup-linux-amd64.tar.gz \
+            "k8s-cf-backup--${version}.x86_64_linux.bottle.tar.gz"
